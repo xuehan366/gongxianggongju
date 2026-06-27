@@ -1,0 +1,13 @@
+{
+  "access_control_enabled": false,
+  "blacklist": [],
+  "global_whitelist": [],
+  "shares": [
+    {
+      "path": "G:/",
+      "port": 6500,
+      "whitelist": [],
+      "whitelist_enabled": false
+    }
+  ]
+}

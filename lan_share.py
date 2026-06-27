@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-局域网文件共享工具 v2
+局域网文件共享工具 v3
 - GUI 界面，拖拽/按钮添加共享文件夹
 - 支持多文件夹同时共享，每个文件夹自动分配端口
 - 启动/停止单个共享，一键启动全部
 - 显示访问地址，双击复制
+- 访问控制：总开关 + 全局黑名单/白名单 + 各文件夹白名单
 """
 
 import http.server
@@ -15,11 +16,11 @@ import sys
 import json
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 from pathlib import Path
 from urllib.parse import unquote
 
-# Windows 任务栏图标：设置 AppUserModelID，让任务栏显示独立图标而非 python.exe
+# Windows 任务栏图标
 if sys.platform == "win32":
     try:
         import ctypes
@@ -69,6 +70,27 @@ tr:hover {{ background: #f8fafc; }}
 </body>
 </html>"""
 
+FORBIDDEN_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>禁止访问</title>
+<style>
+body { font-family: "Microsoft YaHei",sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f5f5f5; }
+.box { text-align: center; padding: 48px; background: #fff; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.1); }
+h1 { color: #e74c3c; font-size: 48px; margin: 0 0 16px; }
+p { color: #888; font-size: 16px; }
+</style>
+</head>
+<body>
+<div class="box">
+<h1>🚫</h1>
+<p>禁止访问</p>
+<p style="font-size:13px;color:#aaa;">您的IP ({client_ip}) 不在允许范围内</p>
+</div>
+</body>
+</html>"""
+
 
 def get_local_ip():
     try:
@@ -108,14 +130,30 @@ def get_file_type(filename):
 
 class FileShareHandler(http.server.SimpleHTTPRequestHandler):
     share_dir = ""
+    access_control = None  # App 实例引用
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=self.share_dir, **kwargs)
 
     def log_message(self, format, *args):
-        pass  # 静默日志
+        pass
+
+    def _check_access(self):
+        """返回 True=允许, False=拒绝"""
+        if self.access_control is None:
+            return True
+        return self.access_control.check_access(self.client_address[0], self.share_dir)
 
     def do_GET(self):
+        if not self._check_access():
+            self.send_response(403)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            html = FORBIDDEN_HTML.format(client_ip=self.client_address[0])
+            self.send_header("Content-Length", str(len(html.encode("utf-8"))))
+            self.end_headers()
+            self.wfile.write(html.encode("utf-8"))
+            return
+
         path = unquote(self.path)
         local_path = os.path.join(self.share_dir, path.lstrip("/"))
 
@@ -180,17 +218,19 @@ class FileShareHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(html.encode("utf-8"))
 
 
-def make_handler(share_dir):
+def make_handler(share_dir, access_control):
     class Handler(FileShareHandler):
         pass
     Handler.share_dir = share_dir
+    Handler.access_control = access_control
     return Handler
 
 
 class ShareServer:
-    def __init__(self, path, port):
+    def __init__(self, path, port, access_control=None):
         self.path = path
         self.port = port
+        self.access_control = access_control
         self.httpd = None
         self.thread = None
         self.running = False
@@ -199,7 +239,7 @@ class ShareServer:
         if self.running:
             return
         socketserver.TCPServer.allow_reuse_address = True
-        self.httpd = socketserver.TCPServer(("0.0.0.0", self.port), make_handler(self.path))
+        self.httpd = socketserver.TCPServer(("0.0.0.0", self.port), make_handler(self.path, self.access_control))
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         self.running = True
@@ -226,29 +266,133 @@ def center_window(win, w, h):
     win.geometry(f"{w}x{h}+{x}+{y}")
 
 
+class IpListDialog(tk.Toplevel):
+    """IP 列表编辑弹窗"""
+    def __init__(self, parent, title, ip_list, callback):
+        super().__init__(parent)
+        self.title(title)
+        self.callback = callback
+        self.ip_list = list(ip_list)
+        self.result = None
+
+        center_window(self, 450, 350)
+        self.configure(bg="#f0f4f8")
+        self.resizable(False, False)
+
+        # 说明
+        tk.Label(self, text="每行一个IP地址，支持通配符 *", bg="#f0f4f8", fg="#555",
+                 font=("Microsoft YaHei", 9)).pack(pady=(12, 4))
+
+        # 文本框
+        text_frame = tk.Frame(self, bg="#fff")
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+
+        self.text = tk.Text(text_frame, font=("Consolas", 11), relief=tk.FLAT,
+                            borderwidth=0, highlightthickness=0)
+        self.text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        # 填充现有IP
+        for ip in self.ip_list:
+            self.text.insert(tk.END, ip + "\n")
+
+        # 按钮
+        btn_frame = tk.Frame(self, bg="#f0f4f8")
+        btn_frame.pack(fill=tk.X, padx=12, pady=12)
+
+        tk.Button(btn_frame, text="取消", command=self.destroy,
+                  bg="#7f8c8d", fg="#fff", font=("Microsoft YaHei", 10),
+                  relief=tk.FLAT, padx=20, pady=4, cursor="hand2").pack(side=tk.RIGHT, padx=4)
+
+        tk.Button(btn_frame, text="保存", command=self._save,
+                  bg="#1a3a5c", fg="#fff", font=("Microsoft YaHei", 10),
+                  relief=tk.FLAT, padx=20, pady=4, cursor="hand2").pack(side=tk.RIGHT, padx=4)
+
+        self.transient(parent)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+    def _save(self):
+        text = self.text.get("1.0", tk.END).strip()
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        self.callback(lines)
+        self.destroy()
+
+
 class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("局域网文件共享工具")
         self.root.resizable(True, True)
-        center_window(self.root, 800, 520)
+        center_window(self.root, 860, 600)
         self.root.configure(bg="#f0f4f8")
 
-        # 设置窗口图标
         ico_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "share.ico")
         if os.path.exists(ico_path):
             self.root.iconbitmap(ico_path)
 
-        self.servers = {}  # port -> ShareServer
-        self.items = {}    # port -> tree item id
+        self.servers = {}
+        self.items = {}
         self.next_port = 8000
         self.script_path = os.path.abspath(__file__)
+
+        # 访问控制配置
+        self.access_control_enabled = False
+        self.blacklist = []
+        self.global_whitelist = []
+        # shares 配置: {port: {whitelist, whitelist_enabled}}
 
         self._build_ui()
         self._load_config()
 
+    # ─── 访问控制核心 ───
+
+    def check_access(self, client_ip, share_dir):
+        """检查客户端IP是否有权访问指定目录"""
+        if not self.access_control_enabled:
+            return True
+
+        # 1. 黑名单检查
+        for pattern in self.blacklist:
+            if self._ip_match(client_ip, pattern):
+                return False
+
+        # 2. 全局白名单：可以访问任意文件夹
+        for pattern in self.global_whitelist:
+            if self._ip_match(client_ip, pattern):
+                return True
+
+        # 3. 查找该共享文件夹的白名单
+        share_path = os.path.abspath(share_dir)
+        for port, srv in self.servers.items():
+            if os.path.abspath(srv.path) == share_path:
+                cfg = self._share_configs.get(port, {})
+                if cfg.get("whitelist_enabled") and cfg.get("whitelist", []):
+                    for pattern in cfg["whitelist"]:
+                        if self._ip_match(client_ip, pattern):
+                            return True
+                    return False  # 白名单开启但不在其中
+                break
+
+        # 4. 没有白名单限制 → 允许
+        return True
+
+    @staticmethod
+    def _ip_match(ip, pattern):
+        """通配符匹配：192.168.1.* 匹配 192.168.1.100"""
+        ip_parts = ip.split(".")
+        p_parts = pattern.split(".")
+        if len(ip_parts) != 4 or len(p_parts) != 4:
+            return ip == pattern
+        for a, b in zip(ip_parts, p_parts):
+            if b == "*":
+                continue
+            if a != b:
+                return False
+        return True
+
+    # ─── 开机自启 ───
+
     def _get_startup_lnk_path(self):
-        """Windows 启动文件夹中的快捷方式路径"""
         startup = os.path.join(os.environ["APPDATA"], "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
         return os.path.join(startup, "局域网文件共享.lnk")
 
@@ -264,7 +408,6 @@ class App:
             messagebox.showinfo("开机自启", "已关闭开机自启")
         else:
             self._create_startup_shortcut(lnk_path)
-            # 验证是否创建成功
             if os.path.exists(lnk_path):
                 self.autostart_var.set(True)
                 self.autostart_btn.config(text="开机自启: 开", bg="#27ae60")
@@ -273,12 +416,9 @@ class App:
                 messagebox.showerror("开机自启", "创建失败，请尝试以管理员身份运行")
 
     def _create_startup_shortcut(self, lnk_path):
-        """创建开机启动快捷方式"""
         python_exe = sys.executable
         workdir = os.path.dirname(self.script_path)
         ico_path = os.path.join(workdir, "share.ico")
-
-        # 用 PowerShell 创建快捷方式
         ps_script = f'''
 $WshShell = New-Object -ComObject WScript.Shell
 $Shortcut = $WshShell.CreateShortcut("{lnk_path}")
@@ -294,6 +434,8 @@ $Shortcut.Save()
             ["powershell", "-NoProfile", "-Command", ps_script],
             capture_output=True, timeout=10
         )
+
+    # ─── UI 构建 ───
 
     def _build_ui(self):
         # 顶部栏
@@ -325,29 +467,45 @@ $Shortcut.Save()
                   bg="#e74c3c", fg="#fff", font=("Microsoft YaHei", 10),
                   relief=tk.FLAT, padx=12, pady=2, cursor="hand2").pack(side=tk.LEFT, padx=4, pady=6)
 
+        # ─── 访问控制开关 ───
+        self.ac_var = tk.BooleanVar(value=False)
+        self.ac_cb = tk.Checkbutton(bar, text="访问控制", variable=self.ac_var,
+                                     command=self._toggle_access_control,
+                                     bg="#fff", font=("Microsoft YaHei", 10),
+                                     activebackground="#fff", cursor="hand2")
+        self.ac_cb.pack(side=tk.LEFT, padx=(20, 4), pady=6)
+
+        tk.Button(bar, text="黑名单", command=self._edit_blacklist,
+                  bg="#e74c3c", fg="#fff", font=("Microsoft YaHei", 9),
+                  relief=tk.FLAT, padx=10, pady=2, cursor="hand2").pack(side=tk.LEFT, padx=2, pady=6)
+
+        tk.Button(bar, text="全局白名单", command=self._edit_global_whitelist,
+                  bg="#3498db", fg="#fff", font=("Microsoft YaHei", 9),
+                  relief=tk.FLAT, padx=10, pady=2, cursor="hand2").pack(side=tk.LEFT, padx=2, pady=6)
+
         # 列表
         list_frame = tk.Frame(self.root, bg="#fff")
         list_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
 
-        columns = ("path", "port", "url", "status")
+        columns = ("path", "port", "url", "whitelist_info", "status")
         self.tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="browse")
         self.tree.heading("path", text="共享文件夹")
         self.tree.heading("port", text="端口")
         self.tree.heading("url", text="访问地址")
+        self.tree.heading("whitelist_info", text="白名单")
         self.tree.heading("status", text="状态")
 
-        self.tree.column("path", width=300, minwidth=200)
-        self.tree.column("port", width=60, anchor=tk.CENTER)
-        self.tree.column("url", width=280, minwidth=200)
+        self.tree.column("path", width=260, minwidth=180)
+        self.tree.column("port", width=55, anchor=tk.CENTER)
+        self.tree.column("url", width=260, minwidth=180)
+        self.tree.column("whitelist_info", width=80, anchor=tk.CENTER)
         self.tree.column("status", width=80, anchor=tk.CENTER)
 
-        # 滚动条
         vsb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # 双击复制地址
         self.tree.bind("<Double-1>", self._on_double_click)
 
         # 底部操作栏
@@ -367,6 +525,10 @@ $Shortcut.Save()
                   bg="#3498db", fg="#fff", font=("Microsoft YaHei", 9),
                   relief=tk.FLAT, padx=10, cursor="hand2").pack(side=tk.LEFT, padx=2)
 
+        tk.Button(btm, text="白名单", command=self._edit_share_whitelist,
+                  bg="#9b59b6", fg="#fff", font=("Microsoft YaHei", 9),
+                  relief=tk.FLAT, padx=10, cursor="hand2").pack(side=tk.LEFT, padx=2)
+
         tk.Button(btm, text="删除选中", command=self._remove_selected,
                   bg="#e74c3c", fg="#fff", font=("Microsoft YaHei", 9),
                   relief=tk.FLAT, padx=10, cursor="hand2").pack(side=tk.LEFT, padx=2)
@@ -375,25 +537,100 @@ $Shortcut.Save()
                   bg="#7f8c8d", fg="#fff", font=("Microsoft YaHei", 9),
                   relief=tk.FLAT, padx=10, cursor="hand2").pack(side=tk.LEFT, padx=2)
 
-        # 开机自启开关
+        # 开机自启
         self.autostart_var = tk.BooleanVar(value=self._is_autostart_enabled())
-        if self.autostart_var.get():
-            text = "开机自启: 开"
-            bg_color = "#27ae60"
-        else:
-            text = "开机自启: 关"
-            bg_color = "#7f8c8d"
+        text = "开机自启: 开" if self.autostart_var.get() else "开机自启: 关"
+        bg_color = "#27ae60" if self.autostart_var.get() else "#7f8c8d"
         self.autostart_btn = tk.Button(btm, text=text, command=self._toggle_autostart,
                   bg=bg_color, fg="#fff", font=("Microsoft YaHei", 9),
                   relief=tk.FLAT, padx=10, cursor="hand2")
         self.autostart_btn.pack(side=tk.RIGHT, padx=2)
+
+    # ─── 访问控制 UI ───
+
+    def _toggle_access_control(self):
+        self.access_control_enabled = self.ac_var.get()
+        self._save_config()
+
+    def _edit_blacklist(self):
+        def callback(new_list):
+            self.blacklist = new_list
+            self._save_config()
+
+        IpListDialog(self.root, "黑名单 - 这些IP禁止访问任何共享", self.blacklist, callback)
+
+    def _edit_global_whitelist(self):
+        def callback(new_list):
+            self.global_whitelist = new_list
+            self._save_config()
+
+        IpListDialog(self.root, "全局白名单 - 这些IP可以访问所有共享", self.global_whitelist, callback)
+
+    def _edit_share_whitelist(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先选中一个共享文件夹")
+            return
+        item = sel[0]
+        port = int(self.tree.item(item, "values")[1])
+        cfg = self._share_configs.get(port, {"whitelist": [], "whitelist_enabled": False})
+
+        # 弹窗：是否启用 + IP列表
+        dlg = tk.Toplevel(self.root)
+        dlg.title("文件夹白名单")
+        center_window(dlg, 450, 400)
+        dlg.configure(bg="#f0f4f8")
+        dlg.resizable(False, False)
+
+        # 启用开关
+        enabled_var = tk.BooleanVar(value=cfg.get("whitelist_enabled", False))
+        cb = tk.Checkbutton(dlg, text="启用白名单（关闭则所有人可访问）", variable=enabled_var,
+                            bg="#f0f4f8", font=("Microsoft YaHei", 10))
+        cb.pack(pady=(12, 4), anchor=tk.W)
+
+        tk.Label(dlg, text="每行一个IP地址，支持通配符 *", bg="#f0f4f8", fg="#555",
+                 font=("Microsoft YaHei", 9)).pack(pady=(0, 4))
+
+        text_frame = tk.Frame(dlg, bg="#fff")
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+
+        text = tk.Text(text_frame, font=("Consolas", 11), relief=tk.FLAT,
+                       borderwidth=0, highlightthickness=0)
+        text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        for ip in cfg.get("whitelist", []):
+            text.insert(tk.END, ip + "\n")
+
+        def save():
+            lines = [l.strip() for l in text.get("1.0", tk.END).strip().split("\n") if l.strip()]
+            self._share_configs[port] = {
+                "whitelist": lines,
+                "whitelist_enabled": enabled_var.get()
+            }
+            self._update_item(item, port)
+            self._save_config()
+            dlg.destroy()
+
+        btn_frame = tk.Frame(dlg, bg="#f0f4f8")
+        btn_frame.pack(fill=tk.X, padx=12, pady=12)
+
+        tk.Button(btn_frame, text="取消", command=dlg.destroy,
+                  bg="#7f8c8d", fg="#fff", font=("Microsoft YaHei", 10),
+                  relief=tk.FLAT, padx=20, pady=4, cursor="hand2").pack(side=tk.RIGHT, padx=4)
+        tk.Button(btn_frame, text="保存", command=save,
+                  bg="#1a3a5c", fg="#fff", font=("Microsoft YaHei", 10),
+                  relief=tk.FLAT, padx=20, pady=4, cursor="hand2").pack(side=tk.RIGHT, padx=4)
+
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+    # ─── 文件夹操作 ───
 
     def _add_folder(self):
         folder = filedialog.askdirectory(title="选择要共享的文件夹")
         if not folder:
             return
 
-        # 检查是否已添加
         for srv in self.servers.values():
             if os.path.abspath(srv.path) == os.path.abspath(folder):
                 messagebox.showwarning("提示", "该文件夹已在列表中")
@@ -402,15 +639,13 @@ $Shortcut.Save()
         port = self.next_port
         self.next_port += 1
 
-        srv = ShareServer(folder, port)
+        srv = ShareServer(folder, port, access_control=self)
         self.servers[port] = srv
+        self._share_configs[port] = {"whitelist": [], "whitelist_enabled": False}
 
         ip = get_local_ip()
         item = self.tree.insert("", tk.END, values=(
-            folder,
-            str(port),
-            f"http://{ip}:{port}",
-            "⏸ 已停止"
+            folder, str(port), f"http://{ip}:{port}", "关闭", "⏸ 已停止"
         ))
         self.items[port] = item
         self._save_config()
@@ -422,6 +657,7 @@ $Shortcut.Save()
         item = sel[0]
         port = int(self.tree.item(item, "values")[1])
         srv = self.servers[port]
+        srv.access_control = self
         srv.start()
         self._update_item(item, port)
 
@@ -431,13 +667,13 @@ $Shortcut.Save()
             return
         item = sel[0]
         port = int(self.tree.item(item, "values")[1])
-        srv = self.servers[port]
-        srv.stop()
+        self.servers[port].stop()
         self._update_item(item, port)
 
     def _start_all(self):
         for port, srv in self.servers.items():
             if not srv.running:
+                srv.access_control = self
                 srv.start()
         self._refresh_all()
 
@@ -459,6 +695,7 @@ $Shortcut.Save()
         self.tree.delete(item)
         del self.servers[port]
         del self.items[port]
+        self._share_configs.pop(port, None)
         self._save_config()
 
     def _change_port(self):
@@ -472,11 +709,9 @@ $Shortcut.Save()
             messagebox.showwarning("提示", "请先停止该共享再修改端口")
             return
 
-        from tkinter import simpledialog
         new_port = simpledialog.askinteger("修改端口", "新端口号:", initialvalue=old_port, minvalue=1024, maxvalue=65535)
         if new_port is None or new_port == old_port:
             return
-
         if new_port in self.servers:
             messagebox.showwarning("提示", "该端口已被占用")
             return
@@ -484,6 +719,8 @@ $Shortcut.Save()
         srv.port = new_port
         self.servers[new_port] = self.servers.pop(old_port)
         self.items[new_port] = self.items.pop(old_port)
+        cfg = self._share_configs.pop(old_port, {"whitelist": [], "whitelist_enabled": False})
+        self._share_configs[new_port] = cfg
         self._update_item(item, new_port)
         self._save_config()
 
@@ -501,11 +738,11 @@ $Shortcut.Save()
         url = self.tree.item(sel[0], "values")[2]
         self.root.clipboard_clear()
         self.root.clipboard_append(url)
-        # 临时提示
         self.tree.item(sel[0], values=(
             self.tree.item(sel[0], "values")[0],
             self.tree.item(sel[0], "values")[1],
             url,
+            self.tree.item(sel[0], "values")[3],
             "✅ 已复制"
         ))
         self.root.after(1500, lambda: self._update_item(sel[0], int(self.tree.item(sel[0], "values")[1])))
@@ -513,16 +750,21 @@ $Shortcut.Save()
     def _update_item(self, item, port):
         ip = get_local_ip()
         srv = self.servers[port]
+        cfg = self._share_configs.get(port, {"whitelist": [], "whitelist_enabled": False})
+        wl_info = f"启用({len(cfg.get('whitelist', []))}个)" if cfg.get("whitelist_enabled") else "关闭"
         self.tree.item(item, values=(
             srv.path,
             str(srv.port),
             f"http://{ip}:{srv.port}",
+            wl_info,
             "▶ 运行中" if srv.running else "⏸ 已停止"
         ))
 
     def _refresh_all(self):
         for port, item in self.items.items():
             self._update_item(item, port)
+
+    # ─── 配置读写 ───
 
     def _load_config(self):
         config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lan_share_config.json")
@@ -531,30 +773,58 @@ $Shortcut.Save()
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            for entry in data:
-                path = entry.get("path", "")
-                port = entry.get("port", 0)
-                if not os.path.isdir(path):
-                    continue
-                if port in self.servers:
-                    continue
-                srv = ShareServer(path, port)
-                self.servers[port] = srv
-                ip = get_local_ip()
-                item = self.tree.insert("", tk.END, values=(
-                    path, str(port), f"http://{ip}:{port}", "⏸ 已停止"
-                ))
-                self.items[port] = item
-                if port >= self.next_port:
-                    self.next_port = port + 1
         except:
-            pass
+            return
+
+        # 全局访问控制
+        self.access_control_enabled = data.get("access_control_enabled", False)
+        self.ac_var.set(self.access_control_enabled)
+        self.blacklist = data.get("blacklist", [])
+        self.global_whitelist = data.get("global_whitelist", [])
+
+        # 共享文件夹
+        self._share_configs = {}
+        shares = data.get("shares", [])
+        for entry in shares:
+            path = entry.get("path", "")
+            port = entry.get("port", 0)
+            if not os.path.isdir(path):
+                continue
+            if port in self.servers:
+                continue
+
+            srv = ShareServer(path, port, access_control=self)
+            self.servers[port] = srv
+            self._share_configs[port] = {
+                "whitelist": entry.get("whitelist", []),
+                "whitelist_enabled": entry.get("whitelist_enabled", False)
+            }
+
+            ip = get_local_ip()
+            wl_info = f"启用({len(self._share_configs[port]['whitelist'])}个)" if self._share_configs[port]["whitelist_enabled"] else "关闭"
+            item = self.tree.insert("", tk.END, values=(
+                path, str(port), f"http://{ip}:{port}", wl_info, "⏸ 已停止"
+            ))
+            self.items[port] = item
+            if port >= self.next_port:
+                self.next_port = port + 1
 
     def _save_config(self):
         config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lan_share_config.json")
-        data = []
+        data = {
+            "access_control_enabled": self.access_control_enabled,
+            "blacklist": self.blacklist,
+            "global_whitelist": self.global_whitelist,
+            "shares": []
+        }
         for port, srv in self.servers.items():
-            data.append({"path": srv.path, "port": srv.port})
+            cfg = self._share_configs.get(port, {"whitelist": [], "whitelist_enabled": False})
+            data["shares"].append({
+                "path": srv.path,
+                "port": srv.port,
+                "whitelist": cfg.get("whitelist", []),
+                "whitelist_enabled": cfg.get("whitelist_enabled", False)
+            })
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
