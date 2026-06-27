@@ -19,6 +19,14 @@ from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 from urllib.parse import unquote
 
+# Windows 任务栏图标：设置 AppUserModelID，让任务栏显示独立图标而非 python.exe
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("LanShare.FileShare")
+    except:
+        pass
+
 TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -226,12 +234,66 @@ class App:
         center_window(self.root, 800, 520)
         self.root.configure(bg="#f0f4f8")
 
+        # 设置窗口图标
+        ico_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "share.ico")
+        if os.path.exists(ico_path):
+            self.root.iconbitmap(ico_path)
+
         self.servers = {}  # port -> ShareServer
         self.items = {}    # port -> tree item id
         self.next_port = 8000
+        self.script_path = os.path.abspath(__file__)
 
         self._build_ui()
         self._load_config()
+
+    def _get_startup_lnk_path(self):
+        """Windows 启动文件夹中的快捷方式路径"""
+        startup = os.path.join(os.environ["APPDATA"], "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+        return os.path.join(startup, "局域网文件共享.lnk")
+
+    def _is_autostart_enabled(self):
+        return os.path.exists(self._get_startup_lnk_path())
+
+    def _toggle_autostart(self):
+        lnk_path = self._get_startup_lnk_path()
+        if os.path.exists(lnk_path):
+            os.remove(lnk_path)
+            self.autostart_var.set(False)
+            self.autostart_btn.config(text="开机自启: 关", bg="#7f8c8d")
+            messagebox.showinfo("开机自启", "已关闭开机自启")
+        else:
+            self._create_startup_shortcut(lnk_path)
+            # 验证是否创建成功
+            if os.path.exists(lnk_path):
+                self.autostart_var.set(True)
+                self.autostart_btn.config(text="开机自启: 开", bg="#27ae60")
+                messagebox.showinfo("开机自启", f"已开启开机自启\n快捷方式: {lnk_path}")
+            else:
+                messagebox.showerror("开机自启", "创建失败，请尝试以管理员身份运行")
+
+    def _create_startup_shortcut(self, lnk_path):
+        """创建开机启动快捷方式"""
+        python_exe = sys.executable
+        workdir = os.path.dirname(self.script_path)
+        ico_path = os.path.join(workdir, "share.ico")
+
+        # 用 PowerShell 创建快捷方式
+        ps_script = f'''
+$WshShell = New-Object -ComObject WScript.Shell
+$Shortcut = $WshShell.CreateShortcut("{lnk_path}")
+$Shortcut.TargetPath = "{python_exe}"
+$Shortcut.Arguments = '"{self.script_path}"'
+$Shortcut.WorkingDirectory = "{workdir}"
+$Shortcut.Description = "局域网文件共享工具"
+$Shortcut.IconLocation = "{ico_path}"
+$Shortcut.Save()
+'''
+        import subprocess
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, timeout=10
+        )
 
     def _build_ui(self):
         # 顶部栏
@@ -312,6 +374,19 @@ class App:
         tk.Button(btm, text="打开文件夹", command=self._open_folder,
                   bg="#7f8c8d", fg="#fff", font=("Microsoft YaHei", 9),
                   relief=tk.FLAT, padx=10, cursor="hand2").pack(side=tk.LEFT, padx=2)
+
+        # 开机自启开关
+        self.autostart_var = tk.BooleanVar(value=self._is_autostart_enabled())
+        if self.autostart_var.get():
+            text = "开机自启: 开"
+            bg_color = "#27ae60"
+        else:
+            text = "开机自启: 关"
+            bg_color = "#7f8c8d"
+        self.autostart_btn = tk.Button(btm, text=text, command=self._toggle_autostart,
+                  bg=bg_color, fg="#fff", font=("Microsoft YaHei", 9),
+                  relief=tk.FLAT, padx=10, cursor="hand2")
+        self.autostart_btn.pack(side=tk.RIGHT, padx=2)
 
     def _add_folder(self):
         folder = filedialog.askdirectory(title="选择要共享的文件夹")
